@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const max_attempts = 3;
+const max_attempts = 10;
 const request_prompt = "请输入需求: ";
+const max_retry_feedback_bytes = 2048;
 
 const Message = struct {
     role: []const u8,
@@ -18,6 +19,12 @@ const ChatRequest = struct {
 const Suggestion = struct {
     command: []const u8,
     executable: []const u8,
+};
+
+const CommandRunResult = struct {
+    exit_code: u8,
+    stdout: []u8,
+    stderr: []u8,
 };
 
 pub fn main() void {
@@ -55,14 +62,16 @@ fn run() !void {
 
     var last_command: ?[]u8 = null;
     var last_executable: ?[]u8 = null;
+    var failure_history: ?[]u8 = null;
     defer {
         if (last_command) |cmd| allocator.free(cmd);
         if (last_executable) |exe| allocator.free(exe);
+        if (failure_history) |history| allocator.free(history);
     }
 
     var attempt: usize = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        const prompt = try buildPrompt(allocator, system_info, request, attempt, last_command, last_executable);
+        const prompt = try buildPrompt(allocator, system_info, request, attempt, failure_history);
         defer allocator.free(prompt);
 
         const raw_command = requestCommandFromDeepSeek(allocator, api_url, api_key, model, prompt) catch |err| {
@@ -98,10 +107,36 @@ fn run() !void {
                 return;
             }
 
-            const exit_code = try runCommand(allocator, command);
-            std.process.exit(exit_code);
+            const result = try runCommand(allocator, command);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+
+            if (result.exit_code == 0) {
+                std.process.exit(0);
+            }
+
+            std.debug.print("command exited with code {d}\n", .{result.exit_code});
+            if (result.stdout.len > 0) {
+                std.debug.print("stdout:\n{s}\n", .{result.stdout});
+            }
+            if (result.stderr.len > 0) {
+                std.debug.print("stderr:\n{s}\n", .{result.stderr});
+            }
+
+            const retry = try confirmRetryWithDeepSeek();
+            if (!retry) {
+                std.process.exit(result.exit_code);
+            }
+
+            const entry = try formatExecutionFailure(allocator, attempt + 1, command, result.exit_code, result.stdout, result.stderr);
+            defer allocator.free(entry);
+            failure_history = try appendFailureHistory(allocator, failure_history, entry);
+            continue;
         }
 
+        const entry = try formatMissingExecutableFailure(allocator, attempt + 1, command, executable);
+        defer allocator.free(entry);
+        failure_history = try appendFailureHistory(allocator, failure_history, entry);
         std.debug.print("attempt {d}/{d}: `{s}` not found, asking DeepSeek for an alternative...\n", .{ attempt + 1, max_attempts, executable });
     }
 
@@ -109,8 +144,12 @@ fn run() !void {
     const cmd = last_command orelse "unavailable";
     std.debug.print("failed after {d} attempts\n", .{max_attempts});
     std.debug.print("last suggested command: {s}\n", .{cmd});
-    std.debug.print("missing executable: {s}\n", .{missing});
-    std.debug.print("please install the related tool and try again\n", .{});
+    if (failure_history) |history| {
+        std.debug.print("failure history:\n{s}\n", .{history});
+    } else {
+        std.debug.print("missing executable: {s}\n", .{missing});
+        std.debug.print("please install the related tool and try again\n", .{});
+    }
 }
 
 fn printUsage() !void {
@@ -221,8 +260,8 @@ fn collectSystemInfo(allocator: std.mem.Allocator) ![]u8 {
     const path = std.process.getEnvVarOwned(allocator, "PATH") catch try allocator.dupe(u8, "unknown");
     defer allocator.free(path);
 
-    const pretty_name = readOsPrettyName(allocator) catch try allocator.dupe(u8, "unknown");
-    defer allocator.free(pretty_name);
+    const platform_name = try detectPlatformName(allocator);
+    defer allocator.free(platform_name);
 
     const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch try allocator.dupe(u8, ".");
     defer allocator.free(cwd);
@@ -238,7 +277,7 @@ fn collectSystemInfo(allocator: std.mem.Allocator) ![]u8 {
         \\
     ,
         .{
-            pretty_name,
+            platform_name,
             @tagName(builtin.os.tag),
             @tagName(builtin.cpu.arch),
             shell,
@@ -248,7 +287,15 @@ fn collectSystemInfo(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
-fn readOsPrettyName(allocator: std.mem.Allocator) ![]u8 {
+fn detectPlatformName(allocator: std.mem.Allocator) ![]u8 {
+    return switch (builtin.os.tag) {
+        .linux => readLinuxPrettyName(allocator) catch allocator.dupe(u8, "Linux"),
+        .macos => allocator.dupe(u8, "macOS"),
+        else => allocator.dupe(u8, @tagName(builtin.os.tag)),
+    };
+}
+
+fn readLinuxPrettyName(allocator: std.mem.Allocator) ![]u8 {
     const file = try std.fs.openFileAbsolute("/etc/os-release", .{});
     defer file.close();
 
@@ -273,16 +320,15 @@ fn buildPrompt(
     system_info: []const u8,
     user_request: []const u8,
     attempt: usize,
-    last_command: ?[]const u8,
-    last_executable: ?[]const u8,
+    failure_history: ?[]const u8,
 ) ![]u8 {
     if (attempt == 0) {
         return try std.fmt.allocPrint(
             allocator,
-            \\你是一个 Linux 命令行助手。根据用户需求返回一个最合适的 shell 命令。
+            \\你是一个 Unix 命令行助手，目标环境可能是 Linux 或 macOS。根据用户需求返回一个最合适的 shell 命令。
             \\要求：
             \\1. 只返回一条命令，不要解释，不要 Markdown，不要代码块。
-            \\2. 优先使用常见、已安装概率高的 Linux 工具。
+            \\2. 优先使用常见、已安装概率高的系统自带工具，并结合系统信息判断当前环境是 Linux 还是 macOS。
             \\3. 尽量避免管道、重定向、shell 内建和复杂脚本。
             \\4. 命令必须能直接在 `sh -lc` 下执行。
             \\5. 如果需求只是查看信息，命令不要修改系统。
@@ -298,31 +344,26 @@ fn buildPrompt(
 
     return try std.fmt.allocPrint(
         allocator,
-        \\你是一个 Linux 命令行助手。之前给出的命令不可用，请换一个方案。
+        \\你是一个 Unix 命令行助手，目标环境可能是 Linux 或 macOS。之前给出的命令已经失败过，请基于完整失败历史换一个方案。
         \\要求：
         \\1. 只返回一条命令，不要解释，不要 Markdown，不要代码块。
-        \\2. 必须更换为其他可执行程序，不能继续使用 `{s}`。
-        \\3. 优先选择标准 Linux 环境中更常见的工具。
-        \\4. 尽量避免管道、重定向、shell 内建和复杂脚本。
-        \\5. 命令必须能直接在 `sh -lc` 下执行。
+        \\2. 优先使用常见、已安装概率高的系统自带工具，并结合系统信息判断当前环境是 Linux 还是 macOS。
+        \\3. 尽量避免管道、重定向、shell 内建和复杂脚本。
+        \\4. 命令必须能直接在 `sh -lc` 下执行。
+        \\5. 必须结合完整失败历史，避免重复使用同样会失败的程序、参数或思路。
         \\
         \\系统信息：
         \\{s}
         \\用户需求：
         \\{s}
         \\
-        \\上一条失败命令：
+        \\失败历史：
         \\{s}
-        \\
-        \\失败原因：
-        \\本地未找到可执行程序 `{s}`，请改用别的命令。
     ,
         .{
-            last_executable orelse "unknown",
             system_info,
             user_request,
-            last_command orelse "unknown",
-            last_executable orelse "unknown",
+            failure_history orelse "无",
         },
     );
 }
@@ -462,17 +503,148 @@ fn confirmExecution(command: []const u8) !bool {
         std.mem.eql(u8, answer, "是");
 }
 
-fn runCommand(allocator: std.mem.Allocator, command: []const u8) !u8 {
-    var child = std.process.Child.init(&.{ "sh", "-lc", command }, allocator);
+fn confirmRetryWithDeepSeek() !bool {
+    std.debug.print("是否将失败信息发给 DeepSeek 并重试？[y/N]: ", .{});
+
+    const stdin = std.fs.File.stdin().deprecatedReader();
+    var line_buffer: [64]u8 = undefined;
+    const line = try stdin.readUntilDelimiterOrEof(&line_buffer, '\n');
+    const answer = std.mem.trim(u8, line orelse "", " \t\r\n");
+
+    return std.ascii.eqlIgnoreCase(answer, "y") or
+        std.ascii.eqlIgnoreCase(answer, "yes") or
+        std.mem.eql(u8, answer, "是");
+}
+
+fn runCommand(allocator: std.mem.Allocator, command: []const u8) !CommandRunResult {
+    const stdout_log = try makeTempLogPath(allocator, "stdout");
+    defer allocator.free(stdout_log);
+    const stderr_log = try makeTempLogPath(allocator, "stderr");
+    defer allocator.free(stderr_log);
+
+    try createEmptyFile(stdout_log);
+    try createEmptyFile(stderr_log);
+    defer std.fs.deleteFileAbsolute(stdout_log) catch {};
+    defer std.fs.deleteFileAbsolute(stderr_log) catch {};
+
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("CLA_COMMAND", command);
+    try env_map.put("CLA_STDOUT_LOG", stdout_log);
+    try env_map.put("CLA_STDERR_LOG", stderr_log);
+
+    var child = std.process.Child.init(&.{
+        "bash",
+        "-lc",
+        "bash -lc \"$CLA_COMMAND\" > >(tee \"$CLA_STDOUT_LOG\") 2> >(tee \"$CLA_STDERR_LOG\" >&2)",
+    }, allocator);
+    child.env_map = &env_map;
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
 
-    return switch (try child.spawnAndWait()) {
-        .Exited => |code| code,
-        .Signal => |sig| @intCast(128 + sig),
-        else => 1,
+    const term = try child.spawnAndWait();
+    const stdout = try readLogFile(allocator, stdout_log);
+    const stderr = try readLogFile(allocator, stderr_log);
+
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = switch (term) {
+            .Exited => |code| code,
+            .Signal => |sig| @intCast(128 + sig),
+            else => 1,
+        },
     };
+}
+
+fn formatExecutionFailure(
+    allocator: std.mem.Allocator,
+    attempt_no: usize,
+    command: []const u8,
+    exit_code: u8,
+    stdout: []const u8,
+    stderr: []const u8,
+) ![]u8 {
+    const clipped_stdout = clipForRetry(stdout);
+    const clipped_stderr = clipForRetry(stderr);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        \\[{d}] execution_failed
+        \\命令：{s}
+        \\退出码：{d}
+        \\stdout：
+        \\{s}
+        \\
+        \\stderr：
+        \\{s}
+    ,
+        .{ attempt_no, command, exit_code, clipped_stdout, clipped_stderr },
+    );
+}
+
+fn formatMissingExecutableFailure(
+    allocator: std.mem.Allocator,
+    attempt_no: usize,
+    command: []const u8,
+    executable: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        \\[{d}] missing_executable
+        \\命令：{s}
+        \\缺失程序：{s}
+    ,
+        .{ attempt_no, command, executable },
+    );
+}
+
+fn appendFailureHistory(
+    allocator: std.mem.Allocator,
+    current: ?[]u8,
+    entry: []const u8,
+) ![]u8 {
+    if (current) |history| {
+        const updated = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ history, entry });
+        allocator.free(history);
+        return updated;
+    }
+
+    return try allocator.dupe(u8, entry);
+}
+
+fn clipForRetry(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return "(empty)";
+    if (trimmed.len <= max_retry_feedback_bytes) return trimmed;
+    return trimmed[0..max_retry_feedback_bytes];
+}
+
+fn makeTempLogPath(allocator: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    const tmp_dir = std.process.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmp_dir);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}/cla-{d}-{s}.log",
+        .{ std.mem.trimRight(u8, tmp_dir, "/"), std.time.nanoTimestamp(), suffix },
+    );
+}
+
+fn createEmptyFile(path: []const u8) !void {
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    file.close();
+}
+
+fn readLogFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer file.close();
+
+    return try file.readToEndAlloc(allocator, 1024 * 1024);
 }
 
 test "normalize strips code fences" {

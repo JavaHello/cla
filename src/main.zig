@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const max_attempts = 3;
+const request_prompt = "请输入需求: ";
 
 const Message = struct {
     role: []const u8,
@@ -134,9 +135,83 @@ fn readUserRequest(allocator: std.mem.Allocator) ![]u8 {
         return try std.mem.join(allocator, " ", args[1..]);
     }
 
-    std.debug.print("请输入需求: ", .{});
-    const stdin = std.fs.File.stdin().deprecatedReader();
-    return try stdin.readUntilDelimiterAlloc(allocator, '\n', 4096);
+    try std.fs.File.stdout().writeAll(request_prompt);
+    return try readInteractiveLine(allocator);
+}
+
+fn readInteractiveLine(allocator: std.mem.Allocator) ![]u8 {
+    const stdin = std.fs.File.stdin();
+    const reader = stdin.deprecatedReader();
+    if (!stdin.isTty()) {
+        return try reader.readUntilDelimiterAlloc(allocator, '\n', 4096);
+    }
+
+    const original_termios = std.posix.tcgetattr(stdin.handle) catch {
+        return try reader.readUntilDelimiterAlloc(allocator, '\n', 4096);
+    };
+
+    var raw_termios = original_termios;
+    raw_termios.lflag.ICANON = false;
+    raw_termios.lflag.ECHO = false;
+    raw_termios.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw_termios.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+
+    std.posix.tcsetattr(stdin.handle, .NOW, raw_termios) catch {
+        return try reader.readUntilDelimiterAlloc(allocator, '\n', 4096);
+    };
+    defer std.posix.tcsetattr(stdin.handle, .NOW, original_termios) catch {};
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+
+    const stdout = std.fs.File.stdout();
+    var byte_buffer: [1]u8 = undefined;
+
+    while (true) {
+        const read_len = try stdin.read(&byte_buffer);
+        if (read_len == 0) break;
+
+        const byte = byte_buffer[0];
+        switch (byte) {
+            '\r', '\n' => {
+                try stdout.writeAll("\r\n");
+                break;
+            },
+            3 => {
+                try stdout.writeAll("^C\r\n");
+                return error.UserAborted;
+            },
+            8, 127 => {
+                removeLastUtf8Codepoint(&bytes);
+                try redrawInteractiveLine(stdout, bytes.items);
+            },
+            else => {
+                if (byte < 32) continue;
+                try bytes.append(allocator, byte);
+                try stdout.writeAll(byte_buffer[0..1]);
+            },
+        }
+    }
+
+    return try bytes.toOwnedSlice(allocator);
+}
+
+fn redrawInteractiveLine(stdout: std.fs.File, line: []const u8) !void {
+    try stdout.writeAll("\r\x1b[2K");
+    try stdout.writeAll(request_prompt);
+    try stdout.writeAll(line);
+}
+
+fn removeLastUtf8Codepoint(bytes: *std.ArrayList(u8)) void {
+    if (bytes.items.len == 0) return;
+
+    var idx = bytes.items.len - 1;
+    while (idx > 0 and isUtf8ContinuationByte(bytes.items[idx])) : (idx -= 1) {}
+    bytes.items.len = idx;
+}
+
+fn isUtf8ContinuationByte(byte: u8) bool {
+    return (byte & 0b1100_0000) == 0b1000_0000;
 }
 
 fn collectSystemInfo(allocator: std.mem.Allocator) ![]u8 {
@@ -414,4 +489,14 @@ test "normalize strips code fences" {
 
 test "extract executable skips sudo and env" {
     try std.testing.expectEqualStrings("df", extractExecutable("sudo env LANG=C df -h /") orelse "");
+}
+
+test "removeLastUtf8Codepoint removes a full utf8 character" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+
+    try bytes.appendSlice(std.testing.allocator, "abc\xe4\xb8\xad");
+    removeLastUtf8Codepoint(&bytes);
+
+    try std.testing.expectEqualStrings("abc", bytes.items);
 }

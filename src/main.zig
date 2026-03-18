@@ -21,6 +21,12 @@ const Suggestion = struct {
     executable: []const u8,
 };
 
+const ExecutionDecision = enum {
+    execute,
+    regenerate,
+    cancel,
+};
+
 const CommandRunResult = struct {
     exit_code: u8,
     stdout: []u8,
@@ -101,10 +107,18 @@ fn run() !void {
         last_executable = executable;
 
         if (try commandExists(allocator, executable)) {
-            const confirmed = try confirmExecution(command);
-            if (!confirmed) {
-                std.debug.print("canceled\n", .{});
-                return;
+            switch (try confirmExecution(command)) {
+                .execute => {},
+                .regenerate => {
+                    const entry = try formatUserRejectedSuggestion(allocator, attempt + 1, command);
+                    defer allocator.free(entry);
+                    failure_history = try appendFailureHistory(allocator, failure_history, entry);
+                    continue;
+                },
+                .cancel => {
+                    std.debug.print("canceled\n", .{});
+                    return;
+                },
             }
 
             const result = try runCommand(allocator, command);
@@ -489,18 +503,30 @@ fn commandExists(allocator: std.mem.Allocator, executable: []const u8) !bool {
     };
 }
 
-fn confirmExecution(command: []const u8) !bool {
+fn confirmExecution(command: []const u8) !ExecutionDecision {
     std.debug.print("准备执行命令:\n{s}\n", .{command});
-    std.debug.print("确认执行？[y/N]: ", .{});
+    std.debug.print("确认执行？[y/N/r(重新提供)]: ", .{});
 
     const stdin = std.fs.File.stdin().deprecatedReader();
     var line_buffer: [64]u8 = undefined;
     const line = try stdin.readUntilDelimiterOrEof(&line_buffer, '\n');
     const answer = std.mem.trim(u8, line orelse "", " \t\r\n");
 
-    return std.ascii.eqlIgnoreCase(answer, "y") or
+    if (std.ascii.eqlIgnoreCase(answer, "y") or
         std.ascii.eqlIgnoreCase(answer, "yes") or
-        std.mem.eql(u8, answer, "是");
+        std.mem.eql(u8, answer, "是"))
+    {
+        return .execute;
+    }
+
+    if (std.ascii.eqlIgnoreCase(answer, "r") or
+        std.ascii.eqlIgnoreCase(answer, "retry") or
+        std.mem.eql(u8, answer, "重新提供"))
+    {
+        return .regenerate;
+    }
+
+    return .cancel;
 }
 
 fn confirmRetryWithDeepSeek() !bool {
@@ -600,6 +626,21 @@ fn formatMissingExecutableFailure(
     );
 }
 
+fn formatUserRejectedSuggestion(
+    allocator: std.mem.Allocator,
+    attempt_no: usize,
+    command: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        \\[{d}] user_requested_alternative
+        \\命令：{s}
+        \\原因：用户要求重新提供一个方案，不能重复当前命令或同样思路
+    ,
+        .{ attempt_no, command },
+    );
+}
+
 fn appendFailureHistory(
     allocator: std.mem.Allocator,
     current: ?[]u8,
@@ -671,4 +712,13 @@ test "removeLastUtf8Codepoint removes a full utf8 character" {
     removeLastUtf8Codepoint(&bytes);
 
     try std.testing.expectEqualStrings("abc", bytes.items);
+}
+
+test "formatUserRejectedSuggestion records regenerate request" {
+    const allocator = std.testing.allocator;
+    const result = try formatUserRejectedSuggestion(allocator, 2, "ls -lah");
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "user_requested_alternative") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ls -lah") != null);
 }
